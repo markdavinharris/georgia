@@ -17,14 +17,18 @@ K = ['party', 'habit', 'freq', 'prim']
 LEVELS = [K[:i] for i in range(len(K), 0, -1)]
 net = lambda s: (s['HardGOP'] + s['SoftGOP']) - (s['HardDem'] + s['SoftDem'])
 
-def load(path, state):
-    j = json.load(open(path)); cols = [x['name'] for x in j['schema']['fields']]
-    assert j.get('jobComplete', True), path
-    df = pd.DataFrame([[c['v'] for c in r['f']] for r in j['rows']], columns=cols)
+def frame(cols, rows, state):
+    """Query M cells as a DataFrame summed over K, for one state (rows: lists in `cols` order)."""
+    df = pd.DataFrame(rows, columns=cols)
     df = df[df.st == state].drop(columns=['st'] + [c for c in ('pad',) if c in df])
     for c in df.columns:
         if c not in ('party', 'habit', 'prim'): df[c] = df[c].astype(int)
     return df.groupby(K).sum(numeric_only=True).reset_index()
+
+def load(path, state):
+    j = json.load(open(path)); cols = [x['name'] for x in j['schema']['fields']]
+    assert j.get('jobComplete', True), path
+    return frame(cols, [[c['v'] for c in r['f']] for r in j['rows']], state)
 
 def hazard(T, d, S=500):
     T = T.copy(); e = 'e%d' % d; T['rem'] = T.n - T[e]; T['late'] = T.fin - T[e]; est = None
@@ -47,10 +51,10 @@ def project(T, S, d, alpha):
 
 def shares(X, col): s = X.groupby('party')[col].sum().reindex(P); return 100 * s / s.sum()
 
-def main():
-    out, state, asof = sys.argv[1], sys.argv[2], int(sys.argv[3])
-    T = {'2022': load(sys.argv[4], state), '2024': load(sys.argv[5], state)}
-    S = load(sys.argv[6], state); S['fin'] = 0
+def compute(T, S, state, asof):
+    """T = {'2022': cells, '2024': cells} (training years, with fin), S = 2026 cells. Returns the proj.json dict."""
+    import datetime
+    S = S.copy(); S['fin'] = 0
     runs = {(t, a): shares(project(T[t], S, asof, a), 'pred') for t in T for a in (0.25, 0.5, 0.75)}
     c = runs[('2022', 0.5)]; early = shares(S, 'e%d' % asof); R = pd.DataFrame(runs)
     bt = []
@@ -58,13 +62,17 @@ def main():
         X = project(T[tr], T[te], asof, 0.5); fa = net(shares(X, 'fin'))
         bt.append(dict(dir=tr[2:] + '->' + te[2:], model=round(net(shares(X, 'pred')) - fa, 1),
                        naive=round(net(shares(X, 'e%d' % asof)) - fa, 1)))
-    import datetime
-    res = dict(state=state, asof=(datetime.date(2026, 11, 3) - datetime.timedelta(days=asof)).isoformat(), dbe=asof,
-               early_votes=int(S['e%d' % asof].sum()),
-               groups=[dict(k=p, early=round(early[p], 1), proj=round(c[p], 1), lo=round(R.loc[p].min(), 1), hi=round(R.loc[p].max(), 1)) for p in P],
-               early_net=round(net(early), 1), proj_net=round(net(c), 1),
-               net_lo=round(min(net(r) for r in runs.values()), 1), net_hi=round(max(net(r) for r in runs.values()), 1),
-               backtest=bt)
+    return dict(state=state, asof=(datetime.date(2026, 11, 3) - datetime.timedelta(days=asof)).isoformat(), dbe=asof,
+                early_votes=int(S['e%d' % asof].sum()),
+                groups=[dict(k=p, early=round(early[p], 1), proj=round(c[p], 1), lo=round(R.loc[p].min(), 1), hi=round(R.loc[p].max(), 1)) for p in P],
+                early_net=round(net(early), 1), proj_net=round(net(c), 1),
+                net_lo=round(min(net(r) for r in runs.values()), 1), net_hi=round(max(net(r) for r in runs.values()), 1),
+                backtest=bt)
+
+def main():
+    out, state, asof = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    T = {'2022': load(sys.argv[4], state), '2024': load(sys.argv[5], state)}
+    res = compute(T, load(sys.argv[6], state), state, asof)
     json.dump(res, open(out, 'w'), separators=(',', ':'))
     print(f"{state} as of d{asof}: early {res['early_net']:+.1f} -> projected {res['proj_net']:+.1f} "
           f"({res['net_lo']:+.1f}..{res['net_hi']:+.1f}); {res['early_votes']:,} early votes")
